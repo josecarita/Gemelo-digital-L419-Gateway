@@ -17,6 +17,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <esp_system.h>
 #include "paquetes.h"
 
 // ================= CONFIGURACIÓN =================
@@ -63,6 +64,8 @@ uint32_t tFlush = 0;
 bool     fsOk = false;
 bool     horaOk = false;
 bool     enDescarga = false;  // mientras se lee la flash no se escribe en ella
+bool     restaurado[256];     // último dato recuperado de la flash tras un reinicio (aún sin datos nuevos)
+const char* motivoReinicio = "?";
 
 // ================= TEXTOS =================
 const char* const NIVEL_CO2[] = {"NORMAL", "ALERTA", "CRITICO", "CALENTANDO", "SIN_DATO"};
@@ -273,7 +276,45 @@ void procesar(const Mensaje& m) {
   proximoId++;
   Serial.println(j.b);
   ultimo[id] = j.b;
+  restaurado[id] = false;
   guardar(j.b);
+}
+
+// Tras un reinicio, recupera de la flash el último mensaje de cada nodo para que la
+// tabla no quede vacía (se muestran como "antes del reinicio" hasta que llegue un dato nuevo).
+void restaurarUltimos() {
+  for (const char* ruta : {ARCH_ANT, ARCH_ACT}) {
+    File f = LittleFS.open(ruta, "r");
+    if (!f) continue;
+    size_t sz = f.size();
+    if (sz > 16384) { f.seek(sz - 16384); f.readStringUntil('\n'); }
+    while (f.available()) {
+      String l = f.readStringUntil('\n');
+      int p = l.indexOf(",\"nodo\":");
+      if (!l.startsWith("{\"id\":") || p < 0) continue;
+      int n = atoi(l.c_str() + p + 8);
+      if (n < 0 || n > 255) continue;
+      ultimo[n] = l;
+      restaurado[n] = true;
+    }
+    f.close();
+  }
+}
+
+// Posición del primer registro con id > desde. Búsqueda binaria: los ids crecen en el
+// archivo, así no hay que leerlo entero en cada consulta (eso congelaba el servidor).
+size_t buscarPos(File& f, uint32_t desde) {
+  size_t lo = 0, hi = f.size();
+  while (hi - lo > 1024) {
+    size_t mid = lo + (hi - lo) / 2;
+    f.seek(mid);
+    f.readStringUntil('\n');                    // descartar la línea cortada
+    if (!f.available()) { hi = mid; continue; }
+    String l = f.readStringUntil('\n');
+    uint32_t id = l.startsWith("{\"id\":") ? strtoul(l.c_str() + 6, nullptr, 10) : 0;
+    if (id <= desde) lo = mid; else hi = mid;
+  }
+  return lo;
 }
 
 // ================= SERVIDOR WEB =================
@@ -291,9 +332,10 @@ a.b{display:inline-block;margin:6px 8px 6px 0;padding:6px 10px;background:#1f386
 fetch('/api/hora?epoch_ms='+Date.now());
 async function act(){try{
  const e=await (await fetch('/api/estado')).json();
- document.getElementById('estado').innerHTML='Registros guardados: <b>'+e.id_ultimo+'</b> · Flash: '+Math.round(e.fs_usado/1024)+' / '+Math.round(e.fs_total/1024)+' KB · Hora: '+(e.hora_ok?'<span class=ok>OK</span>':'<span class=mal>sin hora</span>')+' · Descartados: '+e.descartados;
+ document.getElementById('estado').innerHTML='Registros guardados: <b>'+e.id_ultimo+'</b> · Flash: '+Math.round(e.fs_usado/1024)+' / '+Math.round(e.fs_total/1024)+' KB · Hora: '+(e.hora_ok?'<span class=ok>OK</span>':'<span class=mal>sin hora</span>')+' · Descartados: '+e.descartados+
+  '<br>Gateway encendido hace <b>'+Math.floor(e.encendido_s/60)+' min</b> · Último reinicio: <span class='+(e.reinicio.indexOf('BAJO')>=0||e.reinicio.indexOf('fallo')>=0||e.reinicio.indexOf('watchdog')>=0?'mal':'ok')+'>'+e.reinicio+'</span> · Memoria libre: '+Math.round(e.heap_libre/1024)+' KB';
  const u=await (await fetch('/api/ultimos')).json();
- document.getElementById('t').innerHTML=u.map(r=>'<tr><td>'+r.nodo+'</td><td>'+r.tipo+'</td><td>'+r.hace_s+' s</td><td>'+r.anomalias+'</td><td><code>'+JSON.stringify(r.msg)+'</code></td></tr>').join('');
+ document.getElementById('t').innerHTML=u.map(r=>'<tr><td>'+r.nodo+'</td><td>'+r.tipo+'</td><td'+(r.hace_s<0||r.hace_s>30?' class=mal':'')+'>'+(r.hace_s<0?'antes del reinicio':r.hace_s+' s')+'</td><td>'+r.anomalias+'</td><td><code>'+JSON.stringify(r.msg)+'</code></td></tr>').join('');
 }catch(x){document.getElementById('estado').textContent='Sin conexión con el gateway';}}
 act();setInterval(act,2000);
 </script></body></html>)HTML";
@@ -313,6 +355,10 @@ void hEstado() {
   s += ",\"fs_usado\":" + String(fsOk ? LittleFS.usedBytes() : 0);
   s += ",\"fs_total\":" + String(fsOk ? LittleFS.totalBytes() : 0);
   s += ",\"descartados\":" + String(descartados);
+  s += ",\"encendido_s\":" + String(millis() / 1000);
+  s += ",\"reinicio\":\"" + String(motivoReinicio) + "\"";
+  s += ",\"heap_libre\":" + String(ESP.getFreeHeap());
+  s += ",\"laptops\":" + String(MODO_AP ? WiFi.softAPgetStationNum() : -1);
   s += ",\"modo\":\"" + String(MODO_AP ? "AP" : "STA") + "\"}";
   server.send(200, "application/json", s);
 }
@@ -322,14 +368,16 @@ void hUltimos() {
   String s = "[";
   bool primero = true;
   for (int id = 0; id < 256; id++) {
-    if (!visto[id] || ultimo[id].length() == 0) continue;
+    if (ultimo[id].length() == 0) continue;
     int p = ultimo[id].indexOf("\"tipo\":\"");
     String tipo = p >= 0 ? ultimo[id].substring(p + 8, ultimo[id].indexOf('"', p + 8)) : "?";
     int a = ultimo[id].indexOf("\"anomalias\":\"");
     String an = a >= 0 ? ultimo[id].substring(a + 13, ultimo[id].indexOf('"', a + 13)) : "";
     if (!primero) s += ",";
     primero = false;
-    s += "{\"nodo\":" + String(id) + ",\"tipo\":\"" + tipo + "\",\"hace_s\":" + String((millis() - vistoMs[id]) / 1000) +
+    // hace_s = -1: dato recuperado de antes del último reinicio (todavía no llegó uno nuevo)
+    long hace = restaurado[id] ? -1 : (long)((millis() - vistoMs[id]) / 1000);
+    s += "{\"nodo\":" + String(id) + ",\"tipo\":\"" + tipo + "\",\"hace_s\":" + String(hace) +
          ",\"anomalias\":\"" + an + "\",\"msg\":" + ultimo[id] + "}";
   }
   s += "]";
@@ -366,6 +414,9 @@ void hDatos() {
   for (const char* ruta : {ARCH_ANT, ARCH_ACT}) {
     File f = LittleFS.open(ruta, "r");
     if (!f) continue;
+    size_t pos = buscarPos(f, desde);
+    f.seek(pos);
+    if (pos > 0) f.readStringUntil('\n');      // empezar en una línea completa
     while (f.available() && enviados < maximo) {
       String linea = f.readStringUntil('\n');
       if (!linea.startsWith("{\"id\":")) continue;
@@ -422,11 +473,29 @@ void iniciarRed() {
 #endif
 }
 
+// Motivo del último reinicio del gateway (para diagnosticar cortes de energía o fallos)
+const char* textoReinicio(int r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "encendido normal";
+    case ESP_RST_SW:        return "reinicio por software";
+    case ESP_RST_PANIC:     return "fallo del programa (panic)";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "watchdog (programa bloqueado)";
+    case ESP_RST_BROWNOUT:  return "BAJO VOLTAJE (brownout): revisar cable/fuente USB";
+    case ESP_RST_EXT:       return "boton EN / reset externo";
+    case ESP_RST_DEEPSLEEP: return "salida de deep sleep";
+    default:                return "desconocido";
+  }
+}
+
 // ================= SETUP / LOOP =================
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("# Gateway ESP32 v5 (opcion B: almacenamiento local + laptop por Wi-Fi)");
+  motivoReinicio = textoReinicio((int)esp_reset_reason());
+  Serial.printf("# Motivo del ultimo reinicio: %s\n", motivoReinicio);
 
   cola = xQueueCreate(64, sizeof(Mensaje));
 
@@ -435,6 +504,7 @@ void setup() {
     uint32_t ult = leerUltimoId(ARCH_ACT);
     if (ult == 0) ult = leerUltimoId(ARCH_ANT);
     proximoId = ult + 1;
+    restaurarUltimos();
     Serial.printf("# LittleFS OK: %u / %u KB usados, ultimo id = %u\n",
                   (unsigned)(LittleFS.usedBytes() / 1024), (unsigned)(LittleFS.totalBytes() / 1024), (unsigned)ult);
   } else {
