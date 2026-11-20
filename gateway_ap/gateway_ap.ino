@@ -324,20 +324,40 @@ const char PAGINA[] PROGMEM = R"HTML(<!doctype html><html lang="es"><head><meta 
 table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #ccc;padding:4px 6px;text-align:left;vertical-align:top}
 th{background:#1f3864;color:#fff}.ok{color:#2e7d32}.mal{color:#c62828}code{font-size:12px;word-break:break-all}
 a.b{display:inline-block;margin:6px 8px 6px 0;padding:6px 10px;background:#1f3864;color:#fff;border-radius:4px;text-decoration:none}</style></head>
-<body><h1>Gateway — Gemelo digital L419</h1><div id="estado">Cargando…</div>
+<body><h1>Gateway — Gemelo digital L419</h1><div id="vivo">Conectando…</div><div id="estado">Cargando…</div>
 <p><a class="b" href="/api/datos?desde=0&max=1000000&descargar=1">Descargar todo (JSONL)</a>
 <a class="b" href="/api/estado">Estado (JSON)</a></p>
 <table><thead><tr><th>Nodo</th><th>Tipo</th><th>Hace</th><th>Anomalías</th><th>Último mensaje</th></tr></thead><tbody id="t"></tbody></table>
 <script>
-fetch('/api/hora?epoch_ms='+Date.now());
+// Una consulta a la vez, con tiempo límite: si el gateway tarda o la señal es débil,
+// la consulta se cancela a los 4 s y se reintenta, sin acumular peticiones colgadas.
+let ultOk=0;
+async function pedir(url){
+ const c=new AbortController(), to=setTimeout(()=>c.abort(),4000);
+ try{ const r=await fetch(url,{signal:c.signal,cache:'no-store'}); return await r.json(); }
+ finally{ clearTimeout(to); }
+}
+function enviarHora(){ pedir('/api/hora?epoch_ms='+Date.now()).catch(()=>{}); }
 async function act(){try{
- const e=await (await fetch('/api/estado')).json();
+ const e=await pedir('/api/estado');
+ if(!e.hora_ok) enviarHora();   // el gateway se reinició y perdió la hora
  document.getElementById('estado').innerHTML='Registros guardados: <b>'+e.id_ultimo+'</b> · Flash: '+Math.round(e.fs_usado/1024)+' / '+Math.round(e.fs_total/1024)+' KB · Hora: '+(e.hora_ok?'<span class=ok>OK</span>':'<span class=mal>sin hora</span>')+' · Descartados: '+e.descartados+
   '<br>Gateway encendido hace <b>'+Math.floor(e.encendido_s/60)+' min</b> · Último reinicio: <span class='+(e.reinicio.indexOf('BAJO')>=0||e.reinicio.indexOf('fallo')>=0||e.reinicio.indexOf('watchdog')>=0?'mal':'ok')+'>'+e.reinicio+'</span> · Memoria libre: '+Math.round(e.heap_libre/1024)+' KB';
- const u=await (await fetch('/api/ultimos')).json();
+ const u=await pedir('/api/ultimos');
  document.getElementById('t').innerHTML=u.map(r=>'<tr><td>'+r.nodo+'</td><td>'+r.tipo+'</td><td'+(r.hace_s<0||r.hace_s>30?' class=mal':'')+'>'+(r.hace_s<0?'antes del reinicio':r.hace_s+' s')+'</td><td>'+r.anomalias+'</td><td><code>'+JSON.stringify(r.msg)+'</code></td></tr>').join('');
-}catch(x){document.getElementById('estado').textContent='Sin conexión con el gateway';}}
-act();setInterval(act,2000);
+ ultOk=Date.now();
+}catch(x){ /* sin respuesta: se conserva la tabla y el indicador muestra "Reconectando" */ }
+ setTimeout(act,2000);   // la siguiente consulta solo cuando terminó la anterior
+}
+// Indicador: distingue si falla la conexión con el gateway o si es un nodo el que no envía
+setInterval(()=>{
+ const v=document.getElementById('vivo');
+ if(!ultOk){ v.innerHTML='<span class=mal>● Conectando con el gateway…</span>'; return; }
+ const s=Math.round((Date.now()-ultOk)/1000);
+ v.innerHTML= s<=6 ? '<span class=ok>● En vivo</span> · actualizado hace '+s+' s'
+   : '<span class=mal>● Reconectando…</span> · sin respuesta del gateway hace '+s+' s (señal Wi-Fi débil o gateway ocupado)';
+},1000);
+enviarHora();act();
 </script></body></html>)HTML";
 
 // Permite que una interfaz web servida desde otro origen (p. ej. localhost) lea la API
@@ -460,6 +480,11 @@ void iniciarRed() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   WiFi.softAP(AP_SSID, AP_PASS, AP_CANAL);
+  // Máximo alcance: potencia al máximo y canal de 20 MHz (HT20). Un canal de 40 MHz
+  // tiene menos alcance y sufre más interferencia de las redes vecinas.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
   Serial.printf("# Red propia: SSID=%s  canal=%d  IP=%s\n", AP_SSID, AP_CANAL, WiFi.softAPIP().toString().c_str());
 #else
   WiFi.mode(WIFI_STA);
